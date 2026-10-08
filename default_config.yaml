@@ -1,0 +1,4 @@
+providers: [anthropic]        # chat-model providers the bridge applies to
+model_patterns: ["claude-*"]  # fnmatch on the chat model name (also on its last "/" segment)
+early_stop: true              # stop streaming after the first complete, translatable </invoke>
+log_translations: true        # one console line per translation, no content
