@@ -221,3 +221,126 @@ def test_registry_ignores_junk_tools():
     registry = bridge.build_registry([{"name": ""}, {"name": "t", "parameters": None, "description": None}])
     assert list(registry.tools) == ["t"] and registry.resolve("t") is not None
     assert re.fullmatch(r"\w+", "t")
+
+
+# ---------------------------------------------------------------- namespace prefix, StreamWatch, stop
+
+NS = "antml" + ":"
+
+
+def test_half_namespaced_closing_tag_is_still_incomplete(registry):
+    head = '<invoke name="code_execution_tool">\n<parameter name="code">x</parameter>\n'
+    for tail in ("</" + NS + "inv", "<" + NS + "par", "</a", "<antml"):
+        assert bridge.find_first_invocation(head + tail) is bridge.INCOMPLETE, tail
+    assert bridge.find_first_invocation('<invoke name="t">\nstray words\n') is None  # not a list of parameters
+
+
+def watch_all(text, size=8):
+    watch = bridge.StreamWatch()
+    for i in range(0, len(text), size):
+        inv = watch.feed(text[i : i + size], text[: i + size])
+        if inv is not None:
+            return inv
+    return None
+
+
+@pytest.fixture
+def parses(monkeypatch):
+    calls = {"n": 0}
+    original = bridge._scan
+
+    def counting(text):
+        calls["n"] += 1
+        return original(text)
+
+    monkeypatch.setattr(bridge, "_scan", counting)
+    return calls
+
+
+@pytest.mark.parametrize("ns", ["", NS])
+@pytest.mark.parametrize("size", [1, 3, 7, 8, 64, 500])
+def test_stream_watch_finds_the_same_invocation_as_parsing_every_chunk(registry, ns, size):
+    text = "<function_calls>\n" + invoke("code_execution_tool", CODE, ns) + "\n" + invoke("code_execution_tool", CODE, ns)
+    expected = bridge.find_first_invocation(text)
+    found = watch_all(text, size)
+    assert isinstance(found, bridge.Invocation) and found.end == expected.end and found.params == expected.params
+    assert text[: found.end].endswith("</" + ns + "invoke>")
+
+
+def test_stream_watch_reports_the_first_invocation_once_even_when_it_is_empty(registry):
+    watch = bridge.StreamWatch()
+    text = '<invoke name="code_execution_tool">\n</invoke>\n' + invoke("code_execution_tool", CODE)
+    results = [watch.feed(text[i : i + 5], text[: i + 5]) for i in range(0, len(text), 5)]
+    found = [r for r in results if r is not None]
+    assert len(found) == 1 and found[0].params == []  # the later full call is not offered: the model may correct itself
+
+
+def test_stream_watch_does_not_parse_a_long_value_that_only_mentions_invoke(registry, parses):
+    code = "def f(x):\n    return invoke(x)  # </parameter> literal\n" * 2000
+    text = invoke("text_editor", [("action", "write"), ("path", "/a.py"), ("content", code)])
+    found = watch_all(text)
+    assert found is not None and found.end == len(text)
+    assert parses["n"] <= 4, parses
+
+
+def test_stream_watch_gives_up_on_a_broken_call_without_parsing_the_runaway_that_follows(parses):
+    text = '<invoke name="x">\nstray words\n' + 'noise <invoke name="y">\n</invoke>\n' * 1500
+    assert watch_all(text) is None
+    assert parses["n"] <= 12, parses
+
+
+def test_stream_watch_ignores_quoted_examples_and_fences(parses):
+    prose = ("Use `" + '<invoke name="x">` inline, the word invoke appears a lot.\n') * 1500
+    fenced = "```xml\n" + '<invoke name="x">\n<parameter name="a">1</parameter>\n</invoke>\n' + "```\n"
+    assert watch_all(prose) is None and parses["n"] == 0
+    assert watch_all(fenced) is None and parses["n"] <= 3, parses
+
+
+def test_stream_watch_markup_in_a_value_does_not_cause_a_parse_per_tag(registry, parses):
+    html = "<br/><img src='a'/>\n" * 3000
+    text = invoke("text_editor", [("action", "write"), ("path", "/a.html"), ("content", html)])
+    assert watch_all(text) is not None and parses["n"] <= 4, parses
+
+
+def test_stream_watch_stops_looking_when_its_budget_runs_out():
+    watch = bridge.StreamWatch(budget=60)
+    head = '<invoke name="code_execution_tool">\n<parameter name="code">'
+    assert watch.feed(head, head) is None and not watch.done and watch.pending
+    full = head + "x" * 50 + "</parameter>\n</invoke>"
+    assert watch.feed(full[len(head):], full) is None and watch.done
+    assert watch.feed("more", full + "more") is None
+
+
+# ---- the stop sequence the provider is asked to honour
+
+
+@pytest.mark.parametrize("ns", ["", NS])
+def test_a_stopped_reply_is_completed_into_the_same_call(registry, ns):
+    full = "Thinking.\n\n" + invoke("code_execution_tool", CODE, ns) + "\nthe model went on writing"
+    cut = min(full.index(s) for s in bridge.STOP_SEQUENCES if s in full)
+    stopped = full[:cut]  # what the provider returns: everything before the stop sequence
+    assert stopped.endswith("</" + ns + "paramete")
+    assert bridge.find_first_invocation(stopped) is bridge.INCOMPLETE
+    completed = bridge.complete_stopped(stopped)
+    assert bridge.translate(completed, registry) == bridge.translate(full, registry)
+    assert bridge.translate(completed, registry)["tool_args"]["code"] == "ls -la\necho hi"
+
+
+def test_complete_stopped_leaves_every_other_reply_alone():
+    for text in ("", "plain", "x</parameter>", "x</parameter>\n</invoke>", "x</paramete\n", "x</paramet", '{"tool_name": "x"}'):
+        assert bridge.complete_stopped(text) is None, text
+
+
+def test_stop_sequences_cannot_match_an_empty_or_unrelated_call():
+    for text in (
+        '<invoke name="reader">\n</invoke>', '<invoke name="a"/>', "plain </invoke>", "a>\n</invoke>",
+        '{"tool_name": "response", "tool_args": {"text": "a\n</invoke>"}}',
+    ):
+        assert not any(s in text for s in bridge.STOP_SEQUENCES), text
+
+
+def test_a_literal_closing_pair_inside_a_value_ends_the_call_there(registry):
+    # documented limit, the same with or without a stop sequence: the first "</parameter>\n</invoke>" is the end
+    code = "print('</parameter>\n</invoke>')\nprint(2)"
+    request = bridge.translate(invoke("code_execution_tool", [("code", code)]), registry)
+    assert request["tool_args"]["code"] == "print('"

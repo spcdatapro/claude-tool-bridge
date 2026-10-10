@@ -1,0 +1,103 @@
+<html>
+<head>
+    <title>Claude Tool Bridge</title>
+</head>
+
+<body>
+    <div x-data>
+        <template x-if="config">
+            <div>
+                <div class="section-title">Claude Tool Bridge</div>
+                <div class="section-description">
+                    Translates Claude's native tool calls into Agent Zero's JSON format and stops the model right
+                    after its first call. Changes apply within a few seconds.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Stop the model after its first call</div>
+                        <div class="field-description">
+                            Asks the provider to end the reply at the end of the first tool call, so you do not wait
+                            for (or pay for) text the plugin would discard. If a stopped reply holds no usable call,
+                            the plugin asks again without it and pauses it for three turns.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.stop_sequence"
+                                x-init="if (config.stop_sequence === undefined || config.stop_sequence === null) config.stop_sequence = true" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Ask the core to stop streaming</div>
+                        <div class="field-description">
+                            Asks Agent Zero to stop reading the stream after the first complete call. In Agent Zero
+                            2.13 the Context Window plugin prevents this from shortening the wait; the setting above
+                            is the one that does.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.early_stop"
+                                x-init="if (config.early_stop === undefined || config.early_stop === null) config.early_stop = true" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Log translations</div>
+                        <div class="field-description">
+                            Writes one console line per translated call (tool name and argument count, never content).
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.log_translations"
+                                x-init="if (config.log_translations === undefined || config.log_translations === null) config.log_translations = true" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Providers</div>
+                        <div class="field-description">
+                            Chat-model providers the plugin applies to, separated by commas. Leave empty for all.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <input type="text" placeholder="anthropic"
+                            x-init="if (!Array.isArray(config.providers)) config.providers = ['anthropic']"
+                            :value="(config.providers || []).join(', ')"
+                            @change="config.providers = $event.target.value.split(',').map(s => s.trim()).filter(Boolean)" />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Model name patterns</div>
+                        <div class="field-description">
+                            Patterns for the chat model name (for example <code>claude-*</code>), separated by commas.
+                            Leave empty for every model of those providers.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <input type="text" placeholder="claude-*"
+                            x-init="if (!Array.isArray(config.model_patterns)) config.model_patterns = ['claude-*']"
+                            :value="(config.model_patterns || []).join(', ')"
+                            @change="config.model_patterns = $event.target.value.split(',').map(s => s.trim()).filter(Boolean)" />
+                    </div>
+                </div>
+            </div>
+        </template>
+    </div>
+</body>
+
+</html>

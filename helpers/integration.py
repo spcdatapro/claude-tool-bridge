@@ -2,47 +2,158 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
-from helpers import extract_tools, plugins
+from helpers import cache, extract_tools, plugins
 from usr.plugins.claude_tool_bridge.helpers import bridge
 
 PLUGIN_NAME = "claude_tool_bridge"
 REGISTRY_KEY = "claude_tool_bridge.registry"
+REGISTRY_CACHED_KEY = "claude_tool_bridge.registry_cached"  # the registry of this turn came from the cache
+PLAN_KEY = "claude_tool_bridge.plan"
+STATE_KEY = "claude_tool_bridge.state"
 EARLY_STOP_KEY = "claude_tool_bridge.early_stop"
+STOP_OFF_KEY = "claude_tool_bridge.stop_off"  # in params_persistent: turns left without a stop sequence
+STOP_PAUSE_TURNS = 3  # turns without a stop sequence after one cost a call
 
 DEFAULTS: dict[str, Any] = {
     "providers": ["anthropic"],
     "model_patterns": ["claude-*"],
     "early_stop": True,
+    "stop_sequence": True,
     "log_translations": True,
 }
 
+CONFIG_TTL = 5.0  # seconds a plugin config / model check is reused across turns
+REGISTRY_TTL = 120.0  # seconds a tool registry is reused across turns
+
+_remembered: dict[tuple, tuple[float, Any]] = {}
+
+
+# ---------------------------------------------------------------- small caches
+
+def _temporary(agent: Any) -> dict[str, Any]:
+    """The per-turn scratch dict (Agent Zero clears it at the start of every loop iteration)."""
+    params = getattr(getattr(agent, "loop_data", None), "params_temporary", None)
+    return params if isinstance(params, dict) else {}
+
+
+def _persistent(agent: Any) -> dict[str, Any]:
+    """The scratch dict that lives as long as the agent's current monologue."""
+    params = getattr(getattr(agent, "loop_data", None), "params_persistent", None)
+    return params if isinstance(params, dict) else {}
+
+
+def _scope(agent: Any, *extra: Any) -> tuple | None:
+    """Cache key for what depends on the agent's profile and project; None if it cannot be told."""
+    try:
+        return (*cache.determine_cache_key(agent), *extra)
+    except Exception:
+        return None
+
+
+def _recall(scope: tuple | None, name: str, ttl: float) -> Any:
+    if scope is None:
+        return None
+    hit = _remembered.get((name, *scope))
+    if hit is not None and time.monotonic() - hit[0] < ttl:
+        return hit[1]
+    return None
+
+
+def _store(scope: tuple | None, name: str, value: Any) -> None:
+    if scope is None:
+        return
+    if len(_remembered) > 256:
+        _remembered.clear()
+    _remembered[(name, *scope)] = (time.monotonic(), value)
+
+
+def reset_caches() -> None:
+    _remembered.clear()
+
+
+# ---------------------------------------------------------------- per-turn plan
 
 def load_config(agent: Any) -> dict[str, Any]:
     """Plugin config over the defaults (a saved config.json replaces default_config.yaml whole)."""
-    config = dict(DEFAULTS)
-    saved = plugins.get_plugin_config(PLUGIN_NAME, agent=agent)
-    if isinstance(saved, dict):
-        config.update(saved)
-    return config
+    scope = _scope(agent)
+    config = _recall(scope, "config", CONFIG_TTL)
+    if config is None:
+        config = dict(DEFAULTS)
+        saved = plugins.get_plugin_config(PLUGIN_NAME, agent=agent)
+        if isinstance(saved, dict):
+            config.update(saved)
+        _store(scope, "config", config)
+    return dict(config)
+
+
+def _model_covered(agent: Any, config: dict[str, Any]) -> bool:
+    from plugins._model_config.helpers import model_config
+
+    chat = model_config.get_chat_model_config(agent) or {}
+    return bridge.model_matches(
+        str(chat.get("provider") or ""),
+        str(chat.get("name") or ""),
+        config.get("providers"),
+        config.get("model_patterns"),
+    )
 
 
 def applies(agent: Any, config: dict[str, Any]) -> bool:
     """True if the agent's chat model is covered by the configured providers and patterns."""
     try:
-        from plugins._model_config.helpers import model_config
-
-        chat = model_config.get_chat_model_config(agent) or {}
-        return bridge.model_matches(
-            str(chat.get("provider") or ""),
-            str(chat.get("name") or ""),
-            config.get("providers"),
-            config.get("model_patterns"),
-        )
+        override = agent.context.get_data("chat_model_override")
+        scope = _scope(agent, hash(repr(override)), repr(config.get("providers")), repr(config.get("model_patterns")))
+        covered = _recall(scope, "applies", CONFIG_TTL)
+        if covered is None:
+            covered = _model_covered(agent, config)
+            _store(scope, "applies", covered)
+        return bool(covered)
     except Exception:
         return False
 
+
+def turn_plan(agent: Any) -> tuple[dict[str, Any], bool]:
+    """(config, applies) for this turn: worked out once and shared by the plugin's extensions."""
+    params = _temporary(agent)
+    plan = params.get(PLAN_KEY)
+    if plan is None:
+        config = load_config(agent)
+        plan = (config, applies(agent, config))
+        params[PLAN_KEY] = plan
+    return plan
+
+
+def turn_state(agent: Any) -> dict[str, Any]:
+    """Facts about this turn's request, filled in as it is built (see the stream and stop extensions)."""
+    return _temporary(agent).setdefault(STATE_KEY, {})
+
+
+def stop_enabled(agent: Any, config: dict[str, Any]) -> bool:
+    """Whether this turn's request carries the stop sequence (called once per turn)."""
+    persistent = _persistent(agent)
+    paused = persistent.get(STOP_OFF_KEY)
+    if isinstance(paused, int) and paused > 0:
+        persistent[STOP_OFF_KEY] = paused - 1  # a turn of the pause has passed
+        return False
+    return bool(config.get("stop_sequence"))
+
+
+def stop_failed(agent: Any) -> None:
+    """A stopped reply could not be turned into a call: skip the stop sequence for the next few turns."""
+    _persistent(agent)[STOP_OFF_KEY] = STOP_PAUSE_TURNS
+
+
+def hit_output_limit(llm_result: Any, state: dict[str, Any]) -> bool:
+    """True if the reply ended because it ran out of output tokens, not because a stop sequence fired."""
+    limit = state.get("max_tokens")
+    used = (getattr(llm_result, "usage", None) or {}).get("completion_tokens")
+    return isinstance(limit, int) and isinstance(used, int) and used >= limit
+
+
+# ---------------------------------------------------------------- tools and translation
 
 def has_json_tool_request(text: str) -> bool:
     """True if text already holds a JSON tool call that Agent Zero (or _context_doctor) can use."""
@@ -56,16 +167,36 @@ def has_json_tool_request(text: str) -> bool:
     return True
 
 
+def _build_registry(agent: Any) -> bridge.Registry:
+    from helpers import responses_tools
+
+    tools, name_map = responses_tools.build_responses_function_tools(agent)
+    return bridge.build_registry(tools, name_map)
+
+
 def get_registry(agent: Any) -> bridge.Registry:
-    """Tool registry for this turn; built once, only when an <invoke> shows up."""
-    params = agent.loop_data.params_temporary
+    """Tool registry for this turn: the one built recently for this profile and project, else a new one."""
+    params = _temporary(agent)
     registry = params.get(REGISTRY_KEY)
     if registry is None:
-        from helpers import responses_tools
-
-        tools, name_map = responses_tools.build_responses_function_tools(agent)
-        registry = bridge.build_registry(tools, name_map)
+        scope = _scope(agent)
+        registry = _recall(scope, "registry", REGISTRY_TTL)
+        if registry is not None:
+            params[REGISTRY_CACHED_KEY] = True
+        else:
+            registry = _build_registry(agent)
+            _store(scope, "registry", registry)
         params[REGISTRY_KEY] = registry
+    return registry
+
+
+def refresh_registry(agent: Any) -> bridge.Registry:
+    """Build the registry again, ignoring the cache (a tool may have been added since it was built)."""
+    params = _temporary(agent)
+    registry = _build_registry(agent)
+    _store(_scope(agent), "registry", registry)
+    params[REGISTRY_KEY] = registry
+    params.pop(REGISTRY_CACHED_KEY, None)
     return registry
 
 
@@ -77,5 +208,8 @@ def translate_response(agent: Any, text: str) -> tuple[dict[str, Any], int] | No
         return None
     if has_json_tool_request(text[: inv.start] + "\n" + text[inv.end:]):
         return None
-    request = bridge.request_from_invocation(inv, get_registry(agent))
+    registry = get_registry(agent)
+    request = bridge.request_from_invocation(inv, registry)
+    if request is None and _temporary(agent).get(REGISTRY_CACHED_KEY) and registry.resolve(inv.name) is None:
+        request = bridge.request_from_invocation(inv, refresh_registry(agent))
     return (request, inv.end) if request else None
