@@ -344,3 +344,144 @@ def test_a_literal_closing_pair_inside_a_value_ends_the_call_there(registry):
     code = "print('</parameter>\n</invoke>')\nprint(2)"
     request = bridge.translate(invoke("code_execution_tool", [("code", code)]), registry)
     assert request["tool_args"]["code"] == "print('"
+
+
+# ---------------------------------------------------------------- loop guards, plain text, tolerant arguments
+
+LOOPS = {
+    "empty call": "\n" + '<invoke name="code_execution_tool">\n</invoke>\n\n\n' * 400,
+    "placeholder": "\n" + "<invoke_placeholder>\n</invoke_placeholder>\n\n\n" * 400,
+    "placeholder without closing tag": "\n" + "<invoke_placeholder>\n\n\n" * 400,
+    "namespace prefix": "\n<" + NS * 400,
+}
+
+
+def provider_cut(text, stops):
+    """What the provider returns when told to stop at any of stops: everything before the first match."""
+    return text[: min(text.index(s) for s in stops if s in text)]
+
+
+@pytest.mark.parametrize("name", list(LOOPS))
+def test_every_loop_is_cut_at_its_second_unit_and_recognised(registry, name):
+    cut = provider_cut(LOOPS[name], bridge.LOOP_GUARDS)
+    assert len(cut) < 120 and bridge.loop_cut(cut), repr(cut)
+    assert bridge.translate(cut, registry) is None
+
+
+def test_a_loop_no_guard_matches_is_still_recognised_once_it_has_run_to_the_limit():
+    unmatched = "\n" + '<invoke name="x">\n</invoke>\n\n\n\n' * 400  # four line breaks between units: not worth a fourth slot
+    assert not any(g in unmatched for g in bridge.LOOP_GUARDS) and bridge.looks_degenerate(unmatched)
+
+
+def test_the_plugin_never_asks_for_more_stop_strings_than_fit_and_never_displaces_the_models_own():
+    assert bridge.stops_to_send([], True, True) == [bridge.CALL_STOP, *bridge.LOOP_GUARDS]
+    assert len(bridge.stops_to_send([], True, True)) == bridge.MAX_STOPS
+    assert bridge.stops_to_send([], False, True) == bridge.LOOP_GUARDS and bridge.stops_to_send([], True, False) == [bridge.CALL_STOP]
+    assert bridge.stops_to_send([], False, False) == []
+    assert bridge.stops_to_send(["A", "B", "C", "D"], True, True) == ["A", "B", "C", "D"]
+    assert bridge.stops_to_send(["A", "B", "C"], True, True) == ["A", "B", "C", bridge.CALL_STOP]
+    assert bridge.stops_to_send(["A", bridge.CALL_STOP], True, True) == ["A", bridge.CALL_STOP, *bridge.LOOP_GUARDS[:2]]
+
+
+def test_the_guards_are_built_with_the_namespace_prefix():
+    assert bridge.LOOP_GUARDS[-1] == NS + NS and NS in bridge.LOOP_GUARDS[-1]
+
+
+def test_the_guards_never_match_a_valid_call_or_the_end_of_call_stop():
+    calls = [invoke("code_execution_tool", CODE, ns) for ns in ("", NS)]
+    calls += ["Thinking.\n\n" + calls[0], "<function_calls>\n" + calls[1] + "\n</function_calls>"]
+    for text in calls:
+        assert not any(g in text for g in bridge.LOOP_GUARDS), text
+    assert not any(g in s for g in bridge.LOOP_GUARDS for s in bridge.STOP_SEQUENCES)
+    assert not any(s in g for g in bridge.LOOP_GUARDS for s in bridge.STOP_SEQUENCES)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "", "   \n", "Hello there.", "a < b", '{"tool_name": "response"}',
+        '<invoke name="x">\n<parameter name="code">print(1) <',  # cut after the parameters began: a value held a guard
+        invoke("code_execution_tool", CODE),
+    ],
+)
+def test_loop_cut_ignores_everything_that_is_not_the_start_of_a_loop(text):
+    assert not bridge.loop_cut(text)
+
+
+@pytest.mark.parametrize("text", ["\n<", "Thinking.\n\n</", '\n<invoke name="x">\n', "\n<invoke_placeholder>\n</"])
+def test_loop_cut_recognises_what_is_left_of_a_cut_loop(text):
+    assert bridge.loop_cut(text)
+
+
+def test_one_junk_tag_before_a_real_call_is_not_cut():
+    # the model writes a throwaway tag and then the call properly: the guards must leave it for _context_doctor
+    json_call = '{"tool_name": "response", "tool_args": {"text": "hi"}}'
+    for junk in ("<invoke_placeholder>\n\n\n", "<invoke_placeholder>\n</invoke_placeholder>\n\n\n", '<invoke name="x">\n</invoke>\n\n\n'):
+        text = "Narration.\n\n" + junk + json_call
+        assert not any(g in text for g in bridge.LOOP_GUARDS), junk
+
+
+def test_looks_degenerate_needs_a_long_reply_that_is_mostly_repetition():
+    assert bridge.looks_degenerate(LOOPS["empty call"]) and bridge.looks_degenerate(("x" * 40 + "\n") * 2000)
+    prose = " ".join(f"word{i} sentence {i * 7919 % 1013} about topic" for i in range(300))
+    assert len(prose) > bridge.DEGENERATE_MIN and not bridge.looks_degenerate(prose)
+    assert not bridge.looks_degenerate("ab" * 100) and not bridge.looks_degenerate("")
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("The table has 3 rows.\n\nNothing else to do.", True),
+        ("Use a < b when sorting.", True),
+        ("Example:\n```xml\n" + invoke("x", [("a", "1")]) + "\n```\nThat is the format.", True),
+        ("Done.\n" + invoke("x", [("a", "1")]), False),
+        ("Done <function_calls>", False),
+        ('{"tool_name": "response", "tool_args": {"text": "x"}}', False),
+        ('Done.\n```json\n{"tool_name": "response"}\n```', False),
+        ("<invoke_placeholder>", False),
+        ("", False),
+    ],
+)
+def test_plain_text_means_prose_without_a_call(text, expected):
+    assert bridge.plain_text(text) is expected
+
+
+def tolerant(text):
+    from helpers.dirty_json import DirtyJson
+
+    return DirtyJson.parse_string(text)
+
+
+def test_tool_args_with_loose_quoting_needs_the_tolerant_parser(registry):
+    loose = "{'runtime': \"terminal\", \"code\": \"ls\", \"session\": 2,}"
+    inv = bridge.find_first_invocation(invoke("code_execution_tool", [("tool_args", loose)]))
+    assert bridge.request_from_invocation(inv, registry) is None
+    assert bridge.request_from_invocation(inv, registry, tolerant)["tool_args"] == {
+        "runtime": "terminal", "code": "ls", "session": 2}
+    # strict JSON never needs it, and text that is not an object is not handed to it
+    strict = invoke("code_execution_tool", [("tool_args", '{"code": "ls"}')])
+    assert bridge.translate(strict, registry)["tool_args"] == {"code": "ls"}
+    inv = bridge.find_first_invocation(invoke("code_execution_tool", [("tool_args", "ls -la")]))
+    assert bridge.request_from_invocation(inv, registry, tolerant) is None
+
+
+def test_args_that_wraps_the_real_parameters_is_unwrapped(registry):
+    wrapped = invoke("code_execution_tool", [("args", '{"runtime": "terminal", "code": "ls", "session": 2}')])
+    assert bridge.translate(wrapped, registry)["tool_args"] == {"runtime": "terminal", "code": "ls", "session": 2}
+
+
+@pytest.mark.parametrize("empty", ["null", "{}", "", "  "])
+def test_an_empty_args_next_to_the_real_parameters_is_dropped(registry, empty):
+    call = invoke("code_execution_tool", [("args", empty), ("runtime", "terminal"), ("code", "ls")])
+    assert bridge.translate(call, registry)["tool_args"] == {"runtime": "terminal", "code": "ls"}
+
+
+def test_args_is_left_alone_when_it_is_not_a_wrapper(registry):
+    text = invoke("code_execution_tool", [("args", "-la"), ("runtime", "terminal"), ("code", "ls")])
+    assert bridge.translate(text, registry)["tool_args"]["args"] == "-la"
+    both = invoke("code_execution_tool", [("args", '{"code": "other"}'), ("runtime", "terminal"), ("code", "ls")])
+    assert bridge.translate(both, registry)["tool_args"]["args"] == '{"code": "other"}'
+    own = bridge.build_registry([_tool("t", {"type": "object", "properties": {"args": {"type": "string"}}})])
+    assert bridge.translate(invoke("t", [("args", '{"a": 1}')]), own)["tool_args"] == {"args": '{"a": 1}'}
+    permissive = bridge.build_registry([_tool("p", PERMISSIVE)])  # no declared parameters: nothing to tell a wrapper from
+    assert bridge.translate(invoke("p", [("args", '{"a": 1}')]), permissive)["tool_args"] == {"args": '{"a": 1}'}

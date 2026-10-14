@@ -9,6 +9,8 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import zlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -263,6 +265,80 @@ def complete_stopped(text: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- loop guards
+
+# Some replies are one short unit written over and over until max_tokens runs out: an empty <invoke>, a made-up
+# <invoke_placeholder>, the namespace prefix chained to itself. They never recover, so the provider is asked to
+# stop where the second unit starts; the reply then ends inside the first one and the turn can be asked again.
+# Each string needs the end of one unit and the start of the next, so a lone junk tag followed by a real call
+# (which Agent Zero's _context_doctor can still rescue) does not match.
+LOOP_GUARDS = [
+    "</invoke>\n\n\n<invoke",
+    "invoke_placeholder>\n\n\n<invoke_placeholder",
+    _NS + _NS,
+]
+CALL_STOP = STOP_SEQUENCES[0]  # the end of the first call: the only one of STOP_SEQUENCES that is sent
+# LiteLLM keeps only the first four stop strings of a request (litellm.utils.validate_openai_optional_params cuts the
+# list) and the provider never sees the rest, so what the plugin adds has to fit in what is left.
+MAX_STOPS = 4
+
+
+def stops_to_send(existing: list[str], call: bool, guard: bool) -> list[str]:
+    """The request's stop list: what was already there, then (while there is room) the end-of-call stop and the guards."""
+    stops = list(existing)
+    for wanted in ([CALL_STOP] if call else []) + (LOOP_GUARDS if guard else []):
+        if wanted not in stops and len(stops) < MAX_STOPS:
+            stops.append(wanted)
+    return stops
+
+
+_LOOP_TAIL_RE = re.compile(r'(?:<|</|<(?:antml:)?invoke\s+name="[^"<>\n]*"\s*>)\Z')
+_PARAM_ANY_RE = re.compile(r"<(?:antml:)?parameter\b")
+_TAIL_WINDOW = 200
+DEGENERATE_MIN = 1500  # characters
+DEGENERATE_SAMPLE = 20_000  # characters looked at
+DEGENERATE_RATIO = 0.10  # compressed size over size: prose is 0.3 or more, a loop is under 0.05
+
+
+def loop_cut(text: str) -> bool:
+    """True if text looks like what is left of a reply stopped at one of the LOOP_GUARDS.
+
+    A call that was cut after it had started its parameters is not a loop: the guard string was part of a value.
+    """
+    tail = text.rstrip()
+    if not tail or _PARAM_ANY_RE.search(tail):
+        return False
+    return _LOOP_TAIL_RE.search(tail[-_TAIL_WINDOW:]) is not None
+
+
+def looks_degenerate(text: str) -> bool:
+    """True for a long reply that is almost all repetition (it compresses to a tenth of its size or less)."""
+    sample = text.strip()[:DEGENERATE_SAMPLE]
+    if len(sample) < DEGENERATE_MIN:
+        return False
+    data = sample.encode("utf-8", "replace")
+    return len(zlib.compress(data, 6)) / len(data) < DEGENERATE_RATIO
+
+
+_CALL_MARKS_RE = re.compile(r"</?(?:antml:)?(?:invoke|parameter|function_calls)\b")
+# A reply that is only prose is a final answer when it is long: in replays of real chats, 9 in 10 rejected replies of
+# 800 characters or more were the answer the model sent again through `response`, while the short ones were most often
+# a sentence announcing the next tool call.
+PROSE_MIN_CHARS = 800
+
+
+def plain_text(text: str) -> bool:
+    """True if text is prose: no tool-call tags outside code fences and no JSON call envelope."""
+    body = text.strip()
+    if not body or body.startswith("{") or '"tool_name"' in body or "invoke_placeholder" in body:
+        return False
+    fences = _fenced_ranges(body)
+    for mark in _CALL_MARKS_RE.finditer(body):
+        if not any(start <= mark.start() < end for start, end in fences):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------- registry
 
 def _json_type(value: Any) -> str:
@@ -408,8 +484,31 @@ def _paragraphs(text: str) -> list[str]:
     return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
 
 
-def request_from_invocation(inv: Invocation, registry: Registry) -> dict[str, Any] | None:
-    """Build an A0 tool request from an invocation, or None if it should not be translated."""
+_BAD = object()  # what _parse_json returns when the text is not JSON
+
+
+def _parse_json(text: str, loads: Callable[[str], Any] | None) -> Any:
+    """json.loads first; then, for text that opens an object, the tolerant parser the caller supplied."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if loads is not None and text.lstrip().startswith("{"):
+        try:
+            return loads(text)
+        except Exception:
+            pass
+    return _BAD
+
+
+def request_from_invocation(
+    inv: Invocation, registry: Registry, loads: Callable[[str], Any] | None = None
+) -> dict[str, Any] | None:
+    """Build an A0 tool request from an invocation, or None if it should not be translated.
+
+    loads is an optional tolerant JSON parser (Agent Zero's DirtyJson) for the objects a model writes
+    inside a parameter when it gets the quoting wrong; without it only strict JSON is understood.
+    """
     resolved = registry.resolve(inv.name)
     if resolved is None or not inv.params:
         return None
@@ -439,13 +538,19 @@ def request_from_invocation(inv: Invocation, registry: Registry) -> dict[str, An
 
     args: dict[str, Any] = {}
     if "tool_args" in raw and "tool_args" not in declared:
-        try:
-            nested = json.loads(_trim(raw.pop("tool_args")))
-        except ValueError:
-            return None
+        nested = _parse_json(_trim(raw.pop("tool_args")), loads)
         if not isinstance(nested, dict):
             return None
         args.update(nested)
+    if "args" in raw and "args" not in declared and declared:
+        # `args` is not one of the tool's parameters: the model wrapped the real ones in it, or left it empty
+        wrapped = _trim(raw["args"]).strip()
+        parsed = _parse_json(wrapped, loads) if wrapped else None
+        if parsed is None or parsed == {}:
+            del raw["args"]
+        elif len(raw) == 1 and isinstance(parsed, dict):
+            del raw["args"]
+            args.update(parsed)
     for key, value in raw.items():
         args[key] = coerce(value, spec.properties.get(key), spec.example_types.get(key))
 

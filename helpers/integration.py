@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from helpers import cache, extract_tools, plugins
+from helpers.dirty_json import DirtyJson
 from usr.plugins.claude_tool_bridge.helpers import bridge
 
 PLUGIN_NAME = "claude_tool_bridge"
@@ -14,14 +15,18 @@ REGISTRY_CACHED_KEY = "claude_tool_bridge.registry_cached"  # the registry of th
 PLAN_KEY = "claude_tool_bridge.plan"
 STATE_KEY = "claude_tool_bridge.state"
 EARLY_STOP_KEY = "claude_tool_bridge.early_stop"
-STOP_OFF_KEY = "claude_tool_bridge.stop_off"  # in params_persistent: turns left without a stop sequence
-STOP_PAUSE_TURNS = 3  # turns without a stop sequence after one cost a call
+STOP_OFF_KEY = "claude_tool_bridge.stop_off"  # in params_persistent: turns left without stop sequences
+STOP_PAUSE_TURNS = 3  # turns without stop sequences after one cost a call
+RETRY_KEY = "claude_tool_bridge.retries"  # in params_persistent: silent retries since the last usable reply
+SILENT_RETRY_LIMIT = 2  # replies thrown away in a row before the core is left to deal with them
 
 DEFAULTS: dict[str, Any] = {
     "providers": ["anthropic"],
     "model_patterns": ["claude-*"],
     "early_stop": True,
     "stop_sequence": True,
+    "loop_guard": True,
+    "prose_as_response": True,
     "log_translations": True,
 }
 
@@ -131,19 +136,44 @@ def turn_state(agent: Any) -> dict[str, Any]:
     return _temporary(agent).setdefault(STATE_KEY, {})
 
 
-def stop_enabled(agent: Any, config: dict[str, Any]) -> bool:
-    """Whether this turn's request carries the stop sequence (called once per turn)."""
+def turn_switches(agent: Any, config: dict[str, Any]) -> tuple[bool, bool]:
+    """(stop, guard) for this turn's request: whether it carries the stop sequence at the end of the first call
+    and the loop guards. Called once per turn; both are off while a pause is running."""
     persistent = _persistent(agent)
     paused = persistent.get(STOP_OFF_KEY)
     if isinstance(paused, int) and paused > 0:
         persistent[STOP_OFF_KEY] = paused - 1  # a turn of the pause has passed
-        return False
-    return bool(config.get("stop_sequence"))
+        return False, False
+    return bool(config.get("stop_sequence")), bool(config.get("loop_guard", True))
 
 
 def stop_failed(agent: Any) -> None:
-    """A stopped reply could not be turned into a call: skip the stop sequence for the next few turns."""
+    """A stopped reply could not be turned into a call: no stop sequences for the next few turns."""
     _persistent(agent)[STOP_OFF_KEY] = STOP_PAUSE_TURNS
+
+
+def allow_silent_retry(agent: Any) -> bool:
+    """Spend one silent retry (throw a reply away and ask again). Once SILENT_RETRY_LIMIT are spent there are no
+    more until a usable reply resets them: a silent retry breaks the core's count of consecutive unusable
+    replies, and that count is what stops an agent that cannot recover."""
+    params = getattr(getattr(agent, "loop_data", None), "params_persistent", None)
+    if not isinstance(params, dict):
+        return False
+    used = params.get(RETRY_KEY)
+    used = used if isinstance(used, int) else 0
+    if used >= SILENT_RETRY_LIMIT:
+        return False
+    params[RETRY_KEY] = used + 1
+    return True
+
+
+def retry_pending(agent: Any) -> bool:
+    """True if silent retries have been spent and no usable reply has reset them yet."""
+    return bool(_persistent(agent).get(RETRY_KEY))
+
+
+def retry_reset(agent: Any) -> None:
+    _persistent(agent).pop(RETRY_KEY, None)
 
 
 def hit_output_limit(llm_result: Any, state: dict[str, Any]) -> bool:
@@ -200,6 +230,28 @@ def refresh_registry(agent: Any) -> bridge.Registry:
     return registry
 
 
+def _tolerant_loads(text: str) -> Any:
+    """Agent Zero's own forgiving JSON parser, for objects a model wrote with the quoting wrong."""
+    return DirtyJson.parse_string(text)
+
+
+def plain_text_answer(agent: Any, text: str) -> dict[str, Any] | None:
+    """The `response` call for a reply that is only prose, or None when it should be left to the core.
+
+    The core already does this in Responses mode (agent.py, process_llm_result_tools); in chat mode it would
+    reject the reply and the model would send the same answer again as a call."""
+    body = text.strip()
+    if len(body) < bridge.PROSE_MIN_CHARS or not bridge.plain_text(body) or body.endswith(":"):
+        return None  # a short sentence announcing the next call, a call or half of one, or a reply that ends on a colon
+    if bridge.looks_degenerate(body):
+        return None
+    if has_json_tool_request(body) or extract_tools.is_misformatted_tool_request(body):
+        return None
+    if "response" not in get_registry(agent).tools:
+        return None
+    return {"tool_name": "response", "tool_args": {"text": body}}
+
+
 def translate_response(agent: Any, text: str) -> tuple[dict[str, Any], int] | None:
     """(request, end of the first </invoke>) or None. Never translates a reply that already
     carries a JSON call outside the invocation: _context_doctor rescues those."""
@@ -209,7 +261,7 @@ def translate_response(agent: Any, text: str) -> tuple[dict[str, Any], int] | No
     if has_json_tool_request(text[: inv.start] + "\n" + text[inv.end:]):
         return None
     registry = get_registry(agent)
-    request = bridge.request_from_invocation(inv, registry)
+    request = bridge.request_from_invocation(inv, registry, _tolerant_loads)
     if request is None and _temporary(agent).get(REGISTRY_CACHED_KEY) and registry.resolve(inv.name) is None:
-        request = bridge.request_from_invocation(inv, refresh_registry(agent))
+        request = bridge.request_from_invocation(inv, refresh_registry(agent), _tolerant_loads)
     return (request, inv.end) if request else None

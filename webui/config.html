@@ -33,11 +33,47 @@
 
                 <div class="field">
                     <div class="field-label">
+                        <div class="field-title">Cut loops short</div>
+                        <div class="field-description">
+                            Asks the provider to stop a reply that repeats one short unit (an empty call over and over)
+                            instead of letting it run to the token limit, and asks the turn again. Turn it off if your
+                            agent has to write call tags as plain text.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.loop_guard"
+                                x-init="if (config.loop_guard === undefined || config.loop_guard === null) config.loop_guard = true" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Answer in prose through the response tool</div>
+                        <div class="field-description">
+                            A reply of 800 characters or more that is only text, with no tool call, is sent to the user
+                            through the response tool instead of being rejected and written again. Turn it off for
+                            models older than Claude 5.5.
+                        </div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.prose_as_response"
+                                x-init="if (config.prose_as_response === undefined || config.prose_as_response === null) config.prose_as_response = true" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
                         <div class="field-title">Ask the core to stop streaming</div>
                         <div class="field-description">
                             Asks Agent Zero to stop reading the stream after the first complete call. In Agent Zero
-                            2.13 the Context Window plugin prevents this from shortening the wait; the setting above
-                            is the one that does.
+                            2.13 and 2.14 the Context Window plugin prevents this from shortening the wait; the
+                            setting above is the one that does.
                         </div>
                     </div>
                     <div class="field-control">

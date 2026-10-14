@@ -30,7 +30,7 @@ class ClaudeToolBridgeStream(Extension):
             if not applies:
                 return
             state = integration.turn_state(agent)
-            state["stop"] = integration.stop_enabled(agent, config)
+            state["stop"], state["guard"] = integration.turn_switches(agent, config)
             state["providers"] = config.get("providers")
             state["model_patterns"] = config.get("model_patterns")
         except Exception as exc:  # fail open: leave the callback alone

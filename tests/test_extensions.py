@@ -225,9 +225,14 @@ def run_stop_ext(callback, model=MODEL, **kwargs):
     return data["kwargs"]
 
 
-def test_the_stop_sequence_is_on_by_default():
-    assert integration.DEFAULTS["stop_sequence"] is True
-    assert "stop_sequence: true" in (ROOT / "default_config.yaml").read_text(encoding="utf-8")
+ALL_STOPS = [bridge.CALL_STOP, *bridge.LOOP_GUARDS]  # what a request carries: four, the most LiteLLM lets through
+
+
+def test_the_stop_sequence_the_loop_guard_and_prose_answers_are_on_by_default():
+    yaml = (ROOT / "default_config.yaml").read_text(encoding="utf-8")
+    for key in ("stop_sequence", "loop_guard", "prose_as_response"):
+        assert integration.DEFAULTS[key] is True
+        assert f"{key}: true" in yaml
 
 
 def test_both_extensions_share_one_plan_per_turn(agent, monkeypatch):
@@ -257,30 +262,31 @@ def test_stream_extension_publishes_the_stop_request_with_the_callback(agent, mo
     with_config(monkeypatch, **STOP_ON)
     wrapped = make_wrapped(agent, noop)
     state = agent.loop_data.params_temporary[integration.STATE_KEY]
-    assert wrapped.ctb_state is state and state["stop"] is True
-    with_config(monkeypatch, stop_sequence=False)
+    assert wrapped.ctb_state is state and state["stop"] is True and state["guard"] is True
+    with_config(monkeypatch, stop_sequence=False, loop_guard=False)
     agent.loop_data.params_temporary.clear()
-    assert make_wrapped(agent, noop).ctb_state["stop"] is False
+    state = make_wrapped(agent, noop).ctb_state
+    assert state["stop"] is False and state["guard"] is False
 
 
 def test_stop_extension_adds_the_sequences_and_merges_the_ones_already_set(agent, monkeypatch):
     with_config(monkeypatch, **STOP_ON)
     wrapped = make_wrapped(agent, noop)
     kwargs = run_stop_ext(wrapped)
-    assert kwargs["stop"] == bridge.STOP_SEQUENCES
+    assert kwargs["stop"] == ALL_STOPS and len(ALL_STOPS) == bridge.MAX_STOPS
     assert wrapped.ctb_state["max_tokens"] == 32000
     kwargs = run_stop_ext(wrapped, stop="END")
-    assert kwargs["stop"] == ["END", *bridge.STOP_SEQUENCES]
-    kwargs = run_stop_ext(wrapped, stop=["END", bridge.STOP_SEQUENCES[0]])
-    assert kwargs["stop"] == ["END", *bridge.STOP_SEQUENCES]
+    assert kwargs["stop"] == ["END", *ALL_STOPS[:3]]  # the model's own strings come first, ours fill the rest
+    kwargs = run_stop_ext(wrapped, stop=["END", bridge.CALL_STOP])
+    assert kwargs["stop"] == ["END", *ALL_STOPS[:3]]
     model = SimpleNamespace(a0_model_conf=MODEL.a0_model_conf, kwargs={"stop": ["MODEL"], "max_completion_tokens": 9000})
-    assert run_stop_ext(wrapped, model=model)["stop"] == ["MODEL", *bridge.STOP_SEQUENCES]
+    assert run_stop_ext(wrapped, model=model)["stop"] == ["MODEL", *ALL_STOPS[:3]]
     assert wrapped.ctb_state["max_tokens"] == 9000
 
 
 def test_stop_extension_does_nothing_unless_asked_or_for_other_models(agent, monkeypatch):
     assert "stop" not in run_stop_ext(noop)  # not a callback of this plugin
-    with_config(monkeypatch, stop_sequence=False)
+    with_config(monkeypatch, stop_sequence=False, loop_guard=False)
     wrapped = make_wrapped(agent, noop)
     assert "stop" not in run_stop_ext(wrapped)
     with_config(monkeypatch, **STOP_ON)
@@ -288,7 +294,7 @@ def test_stop_extension_does_nothing_unless_asked_or_for_other_models(agent, mon
     wrapped = make_wrapped(agent, noop)
     other = SimpleNamespace(a0_model_conf=SimpleNamespace(provider="openai", name="gpt-5"), kwargs={})
     assert "stop" not in run_stop_ext(wrapped, model=other)
-    assert wrapped.ctb_state["stop"] is False
+    assert wrapped.ctb_state["stop"] is False and wrapped.ctb_state["guard"] is False
     assert "stop" not in run_stop_ext(wrapped, model=SimpleNamespace(kwargs={}))  # no model config: stay out
     assert run_stop_ext(None) == {"response_callback": None}
 
@@ -314,7 +320,7 @@ def test_loop_extension_leaves_a_reply_that_ran_out_of_tokens_alone(agent, monke
 
 
 def test_loop_extension_does_not_complete_a_reply_nobody_stopped(agent, monkeypatch):
-    with_config(monkeypatch, stop_sequence=False)
+    with_config(monkeypatch, stop_sequence=False, loop_guard=False)
     make_wrapped(agent, noop)
     llm, _ = run_loop_ext(agent, STOPPED, usage={"completion_tokens": 120})
     assert llm.response == STOPPED
@@ -330,9 +336,11 @@ def test_a_stopped_reply_without_a_usable_call_is_dropped_and_asked_again_withou
     assert agent.loop_data.params_persistent[integration.STOP_OFF_KEY] == integration.STOP_PAUSE_TURNS
     for turn in range(integration.STOP_PAUSE_TURNS):  # the retry and the turns after it go without a stop
         agent.loop_data.params_temporary.clear()
-        assert make_wrapped(agent, noop).ctb_state["stop"] is False, turn
+        state = make_wrapped(agent, noop).ctb_state
+        assert state["stop"] is False and state["guard"] is False, turn
     agent.loop_data.params_temporary.clear()
-    assert make_wrapped(agent, noop).ctb_state["stop"] is True  # the pause is over
+    state = make_wrapped(agent, noop).ctb_state
+    assert state["stop"] is True and state["guard"] is True  # the pause is over
 
 
 def test_stop_extension_survives_a_broken_state(agent, monkeypatch):
@@ -455,3 +463,200 @@ def test_a_stopped_reply_with_loose_parameters_and_no_opening_tag_is_asked_again
     agent2 = SimpleNamespace(loop_data=SimpleNamespace(params_temporary={}, params_persistent={}))
     llm, data = run_loop_ext(agent2, loose)
     assert llm.response == loose and "skip_default_processing" not in data
+
+
+# ---------------------------------------------------------------- loop guards, silent retries, prose answers
+
+EMPTY_LOOP = "\n" + '<invoke name="code_execution_tool">\n</invoke>\n\n\n' * 300
+CUT_LOOP = EMPTY_LOOP[: EMPTY_LOOP.index("</invoke>")]  # what the provider returns when it stops at the guard
+RESPONSE_TOOL = {"name": "response", "description": "", "parameters": {
+    "type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}
+JSON_CALL = '{"tool_name": "response", "tool_args": {"text": "hi"}}'
+
+
+@pytest.fixture
+def answering(agent, monkeypatch):
+    """An agent whose tools include `response`, as in Agent Zero."""
+    registry = bridge.build_registry([*TOOLS, RESPONSE_TOOL])
+    monkeypatch.setattr(integration, "get_registry", lambda a: registry)
+    return agent
+
+
+def turn(agent, monkeypatch=None, **config):
+    """Start a turn the way the stream extension does (so the state carries the switches) and record max_tokens."""
+    if monkeypatch is not None:
+        with_config(monkeypatch, **config)
+    agent.loop_data.params_temporary.clear()
+    wrapped = make_wrapped(agent, noop)
+    run_stop_ext(wrapped)
+    return wrapped
+
+
+def test_a_loop_cut_at_its_second_unit_is_asked_again_with_the_guards_still_on(agent, monkeypatch):
+    turn(agent, monkeypatch)
+    llm, data = run_loop_ext(agent, CUT_LOOP, usage={"completion_tokens": 30})
+    assert llm.response == "" and data["skip_default_processing"] is True
+    persistent = agent.loop_data.params_persistent
+    assert persistent[integration.RETRY_KEY] == 1 and integration.STOP_OFF_KEY not in persistent  # no pause
+    state = turn(agent).ctb_state
+    assert state["guard"] is True and state["stop"] is True
+
+
+def test_only_a_few_replies_are_thrown_away_in_a_row_and_a_usable_reply_ends_the_spell(agent, monkeypatch):
+    turn(agent, monkeypatch)
+    for _ in range(integration.SILENT_RETRY_LIMIT):
+        llm, data = run_loop_ext(agent, CUT_LOOP, usage={"completion_tokens": 30})
+        assert llm.response == "" and data["skip_default_processing"] is True
+    llm, data = run_loop_ext(agent, CUT_LOOP, usage={"completion_tokens": 30})  # spent: the core gets it
+    assert llm.response == CUT_LOOP and "skip_default_processing" not in data
+    assert integration.retry_pending(agent)
+    run_loop_ext(agent, JSON_CALL)  # the model recovered
+    assert not integration.retry_pending(agent)
+    llm, data = run_loop_ext(agent, CUT_LOOP, usage={"completion_tokens": 30})
+    assert llm.response == "" and data["skip_default_processing"] is True
+
+
+def test_a_reply_that_ran_to_max_tokens_as_a_loop_is_thrown_away_too(agent, monkeypatch):
+    turn(agent, monkeypatch)
+    llm, data = run_loop_ext(agent, EMPTY_LOOP, usage={"completion_tokens": 32000})
+    assert llm.response == "" and data["skip_default_processing"] is True
+
+
+def test_the_loop_guard_can_be_turned_off(agent, monkeypatch):
+    turn(agent, monkeypatch, stop_sequence=False, loop_guard=False)
+    for reply in (CUT_LOOP, EMPTY_LOOP):
+        llm, data = run_loop_ext(agent, reply, usage={"completion_tokens": 32000})
+        assert llm.response == reply and "skip_default_processing" not in data
+    assert not agent.loop_data.params_persistent
+
+
+def test_a_repetitive_call_is_not_a_loop(agent, monkeypatch):
+    turn(agent, monkeypatch)
+    call = json.dumps({"tool_name": "code_execution_tool", "tool_args": {"code": "invoke it\n" * 400}})
+    llm, data = run_loop_ext(agent, call, usage={"completion_tokens": 900})
+    assert llm.response == call and "skip_default_processing" not in data
+    mixed = EMPTY_LOOP[:3000] + "\n" + call  # empty calls and then a JSON call: the core's repair takes it
+    llm, data = run_loop_ext(agent, mixed, usage={"completion_tokens": 900})
+    assert llm.response == mixed and "skip_default_processing" not in data
+
+
+def test_a_call_cut_inside_a_value_by_a_guard_is_asked_again_with_everything_paused(agent, monkeypatch):
+    turn(agent, monkeypatch, stop_sequence=False)  # only the guards are in the request
+    elsewhere = CALL[: CALL.index("ls")]
+    llm, data = run_loop_ext(agent, elsewhere, usage={"completion_tokens": 40})
+    assert llm.response == "" and data["skip_default_processing"] is True
+    assert agent.loop_data.params_persistent[integration.STOP_OFF_KEY] == integration.STOP_PAUSE_TURNS
+    state = turn(agent).ctb_state
+    assert state["stop"] is False and state["guard"] is False
+
+
+def test_a_stopped_reply_and_a_loop_share_the_retry_budget(agent, monkeypatch):
+    unknown = STOPPED.replace("code_execution_tool", "no_such_tool")
+    for reply in (unknown, CUT_LOOP):
+        agent.loop_data.params_persistent.pop(integration.STOP_OFF_KEY, None)
+        turn(agent, monkeypatch)
+        llm, _ = run_loop_ext(agent, reply, usage={"completion_tokens": 30})
+        assert llm.response == ""
+    agent.loop_data.params_persistent.pop(integration.STOP_OFF_KEY, None)
+    turn(agent, monkeypatch)
+    llm, data = run_loop_ext(agent, unknown, usage={"completion_tokens": 30})
+    assert llm.response == unknown and "skip_default_processing" not in data  # budget spent
+    assert agent.loop_data.params_persistent[integration.STOP_OFF_KEY] == integration.STOP_PAUSE_TURNS  # still paused
+
+
+def test_without_loop_data_there_is_nothing_to_remember_so_nothing_is_thrown_away():
+    assert integration.allow_silent_retry(SimpleNamespace()) is False
+    assert integration.allow_silent_retry(SimpleNamespace(loop_data=SimpleNamespace(params_persistent=None))) is False
+
+
+def test_switches_are_off_while_a_pause_runs_and_the_pause_counts_down_once_per_turn(agent):
+    config = dict(integration.DEFAULTS)
+    assert integration.turn_switches(agent, config) == (True, True)
+    integration.stop_failed(agent)
+    assert [integration.turn_switches(agent, config) for _ in range(integration.STOP_PAUSE_TURNS)] == [(False, False)] * 3
+    assert integration.turn_switches(agent, config) == (True, True)
+    assert integration.turn_switches(agent, {**config, "stop_sequence": False}) == (False, True)
+    assert integration.turn_switches(agent, {**config, "loop_guard": False}) == (True, False)
+
+
+def test_the_stop_extension_sends_only_the_sequences_that_are_switched_on(agent, monkeypatch):
+    turn(agent, monkeypatch, stop_sequence=False)
+    assert run_stop_ext(make_wrapped(agent, noop))["stop"] == bridge.LOOP_GUARDS
+    agent.loop_data.params_temporary.clear()
+    with_config(monkeypatch, loop_guard=False)
+    assert run_stop_ext(make_wrapped(agent, noop))["stop"] == [bridge.CALL_STOP]
+
+
+def test_what_does_not_fit_in_the_four_stop_strings_is_not_expected_back(agent, monkeypatch):
+    with_config(monkeypatch)
+    for existing, stop, guard in [(["A", "B", "C", "D"], False, False), (["A", "B", "C"], True, False), (["A"], True, True)]:
+        agent.loop_data.params_temporary.clear()
+        wrapped = make_wrapped(agent, noop)
+        kwargs = run_stop_ext(wrapped, stop=existing)
+        assert kwargs["stop"] == bridge.stops_to_send(existing, True, True) and len(kwargs["stop"]) <= bridge.MAX_STOPS
+        assert (wrapped.ctb_state["stop"], wrapped.ctb_state["guard"]) == (stop, guard), existing
+
+
+# ---- prose
+
+PROSE = (
+    "The query returns 3 rows.\n\n"
+    + " ".join(f"word{i} sentence {i * 7919 % 1013} about topic" for i in range(40))
+    + "\n\nThe third one is the problem: it has no key."
+)
+assert bridge.PROSE_MIN_CHARS <= len(PROSE) < bridge.DEGENERATE_MIN
+
+
+def test_a_prose_reply_goes_out_through_the_response_tool(answering, monkeypatch):
+    with_config(monkeypatch)
+    llm, data = run_loop_ext(answering, "  " + PROSE + "\n")
+    assert json.loads(llm.response) == {"tool_name": "response", "tool_args": {"text": PROSE}}
+    assert "skip_default_processing" not in data
+    transformed = transform_response(llm.response, suppress_xml=True, split_thoughts=True)
+    assert looks_like_tool_call(llm.response, transformed)
+    name, args = extract_tools.normalize_tool_request(extract_tools.extract_tool_request(transformed))
+    assert name == "response" and args["text"] == PROSE
+
+
+def test_prose_with_a_quoted_example_is_still_an_answer(answering, monkeypatch):
+    with_config(monkeypatch)
+    text = "This is the format:\n```xml\n" + CALL + "\n```\nUse it like that. " + PROSE
+    llm, _ = run_loop_ext(answering, text)
+    assert json.loads(llm.response)["tool_args"]["text"] == text
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Let me check the tables first:",  # announces the next step
+        "Short answer: yes.",  # a short reply is most often a sentence before the next call, not the answer
+        PROSE + ":",  # a long one that ends on a colon announces something too
+        "I will run it.\n" + CALL.replace("code_execution_tool", "no_such_tool"),  # a call to nothing
+        'Here it is:\n```json\n{"tool_name": "response", "tool_args": {"text": "x"}}\n```',
+        "Done <function_calls>",
+        "x " * 1000,  # a loop of words
+    ],
+)
+def test_prose_is_not_turned_into_an_answer_when_it_is_not_one(answering, monkeypatch, reply):
+    with_config(monkeypatch)
+    llm, data = run_loop_ext(answering, reply)
+    assert llm.response == reply and "skip_default_processing" not in data
+
+
+def test_prose_stays_as_it_is_when_asked_to_or_cut_short_or_without_a_response_tool(answering, agent, monkeypatch):
+    with_config(monkeypatch, prose_as_response=False)
+    assert run_loop_ext(answering, PROSE)[0].response == PROSE
+    turn(answering, monkeypatch)
+    assert run_loop_ext(answering, PROSE, usage={"completion_tokens": 32000})[0].response == PROSE  # cut by the limit
+    registry = bridge.build_registry(TOOLS)  # no `response` tool known
+    monkeypatch.setattr(integration, "get_registry", lambda a: registry)
+    with_config(monkeypatch)
+    assert run_loop_ext(agent, PROSE)[0].response == PROSE
+
+
+def test_a_prose_answer_ends_the_spell_of_thrown_away_replies(answering, monkeypatch):
+    turn(answering, monkeypatch)
+    run_loop_ext(answering, CUT_LOOP, usage={"completion_tokens": 30})
+    assert integration.retry_pending(answering)
+    llm, _ = run_loop_ext(answering, PROSE, usage={"completion_tokens": 30})
+    assert json.loads(llm.response)["tool_name"] == "response" and not integration.retry_pending(answering)

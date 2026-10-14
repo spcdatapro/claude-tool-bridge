@@ -1,7 +1,7 @@
 name: claude_tool_bridge
 title: Claude Tool Bridge
 description: Translates Claude's native <invoke> tool calls into Agent Zero's JSON tool requests so Claude 5 models work in chat mode.
-version: 0.2.0
+version: 0.3.0
 settings_sections: ["agent"]
 per_project_config: false
 per_agent_config: false

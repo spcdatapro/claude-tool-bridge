@@ -2,4 +2,6 @@ providers: [anthropic]        # chat-model providers the bridge applies to
 model_patterns: ["claude-*"]  # fnmatch on the chat model name (also on its last "/" segment)
 early_stop: true              # ask the core to stop streaming after the first complete, translatable </invoke>
 stop_sequence: true           # ask the provider to stop at the end of the first call (saves the time and tokens spent after it)
+loop_guard: true              # ask the provider to stop a reply that repeats one short unit, and ask the turn again
+prose_as_response: true       # a reply that is only prose goes out through the response tool instead of being rejected
 log_translations: true        # one console line per translation, no content
